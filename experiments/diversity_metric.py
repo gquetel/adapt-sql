@@ -14,7 +14,7 @@ import torch
 from scipy.stats import gmean
 from scipy.spatial.distance import pdist
 
-from transformers import RobertaTokenizerFast, RobertaModel
+from sentence_transformers import SentenceTransformer
 from tqdm import tqdm
 from sklearn.manifold import TSNE
 from sklearn.feature_extraction.text import CountVectorizer
@@ -117,49 +117,36 @@ def print_unique_pts(queries: list, type: str, name: str) -> dict:
     return {"n_unique_parse_trees": len(pts), "n_parse_errors": cnt_prserr}
 
 
+# Sentence-BERT model with the best average score in the SBERT pretrained models
+# table: https://www.sbert.net/docs/sentence_transformer/pretrained_models.html
+SBERT_MODEL = "sentence-transformers/all-mpnet-base-v2"
+
+
 def compute_embeddings(df: pd.DataFrame):
-    """Compute SecureBERT embeddings of queries (column 'full_query').
+    """Compute Sentence-BERT embeddings of queries (column 'full_query').
 
     This is a one-time experiment, so embeddings are recomputed every call (no
     caching).
+
+    The model applies mean pooling over the token embeddings. Inputs longer
+    than the model limit (384 tokens) are truncated.
 
     Args:
         df (pd.DataFrame): frame with a 'full_query' column to embed.
     """
     queries = df["full_query"].to_list()
 
-    bert_model = "ehsanaghaei/SecureBERT"
-    tokenizer = RobertaTokenizerFast.from_pretrained(bert_model)
-    rb_model = RobertaModel.from_pretrained(bert_model)
-    rb_model.eval()
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    rb_model.to(device)
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
+    model = SentenceTransformer(SBERT_MODEL, device=device)
+
     # We compute embeddings by batches, they should not be too big because
     # they might be bigger than memory.
-    embeddings = []
-
-    batch_size = 64
-    with torch.no_grad():
-        for i in tqdm(range(0, len(queries), batch_size)):
-            batch_queries = queries[i : i + batch_size]
-
-            inputs = tokenizer(
-                batch_queries,
-                padding=True,
-                truncation=True,
-                max_length=512,
-                return_tensors="pt",
-            )
-
-            # Move inputs to device and get embeddings.
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-
-            # Move back to CPU and convert to numpy
-            outputs = rb_model(**inputs, output_hidden_states=True)
-            batch_embeddings = outputs.pooler_output.cpu().numpy()
-            embeddings.extend(batch_embeddings)
-
-    return np.array(embeddings)
+    return model.encode(
+        queries,
+        batch_size=64,
+        show_progress_bar=True,
+        convert_to_numpy=True,
+    )
 
 
 def print_dataset_tsne(
@@ -209,7 +196,7 @@ def print_dataset_tsne(
 
     plt.title(
         f"t-SNE Visualization of {name} {type} \n"
-        f"Using SecureBERT Embeddings (n={len(queries)})"
+        f"Using Sentence-BERT ({SBERT_MODEL}) Embeddings (n={len(queries)})"
     )
     plt.xlabel("t-SNE Component 1")
     plt.ylabel("t-SNE Component 2")
@@ -249,10 +236,9 @@ def print_div_sem(
         n_repeats (int): number of subsamples to average over.
     """
 
-    # A pairwise distance needs at least two points. The train splits are
-    # normal-only (attacks live in the test split), so the attack pool is empty
-    # there -- skip it cleanly (before the costly embedding step) instead of
-    # crashing on a 0-row array.
+    # A pairwise distance needs at least two points. A pool can be empty (e.g. a
+    # dataset without attacks) -- skip it cleanly (before the costly embedding
+    # step) instead of crashing on a 0-row array.
     if len(df) < 2:
         print(
             f"Semantic Diversity of {type} for dataset {name}: skipped "
@@ -326,12 +312,18 @@ def load_wafamole_samples(fp_sane: str, fp_attacks: str):
     return pd.concat([df_sane, df_attack])
 
 
+def load_kaggle_samples(fp: Path) -> pd.DataFrame:
+    """Load the Kaggle SQL injection dataset (columns 'Query' and 'Label')."""
+    df = pd.read_csv(fp)
+    return df.rename(columns={"Query": "full_query", "Label": "label"})
+
+
 def process_dataset(
     df: pd.DataFrame,
     name: str,
     query_column: str = "full_query",
     label_column: str = "label",
-    split_column: str = "split",
+    split_column: str | None = "split",
     sem_sample_size: int = 20000,
     vocab: bool = True,
     parse_trees: bool = True,
@@ -341,25 +333,35 @@ def process_dataset(
     diversity for one dataset.
 
     Source layout (see experiments/build_big_trainsets.py): the *train* split is
-    benign-only (~100k normal queries, label 0) and the attacks live in the
-    *test* split (~100k, label 1). We therefore draw:
-      - normal queries from the train split,
-      - attack queries from the test split.
+    benign-only and the *test* split holds both normal queries and attacks of the
+    target domain. We only measure the target domain, so we draw both the normal
+    and the attack pools from the test split. The test split of a LODO dataset
+    (e.g. BCD-A) is the same as the test split of the in-domain dataset (A-A),
+    thus the in-domain datasets are sufficient.
 
     Lexical and syntactic metrics are cheap enough to run on the *full* normal and
-    attack pools. Semantic diversity (the expensive SecureBERT embedding step) is
+    attack pools. Semantic diversity (the expensive Sentence-BERT embedding step) is
     run on a random sub-pool of `sem_sample_size` queries per label.
 
     All three metrics default to on so a single call reports lex + synt + sem.
+
+    External datasets (Kaggle, WAF-A-MoLE) have no split: set `split_column` to
+    None to draw each pool from all the queries with that label.
 
     Returns one row dict per label (normal, attack) with every computed metric, so
     the caller can aggregate the rows into the per-mode results CSV.
     """
     # (label type, source split, frame) for the two pools we measure.
-    pools = [
-        ("normal", "train", df[(df[split_column] == "train") & (df[label_column] == 0)]),
-        ("attack", "test", df[(df[split_column] == "test") & (df[label_column] == 1)]),
-    ]
+    if split_column is None:
+        pools = [
+            ("normal", "all", df[df[label_column] == 0]),
+            ("attack", "all", df[df[label_column] == 1]),
+        ]
+    else:
+        pools = [
+            ("normal", "test", df[(df[split_column] == "test") & (df[label_column] == 0)]),
+            ("attack", "test", df[(df[split_column] == "test") & (df[label_column] == 1)]),
+        ]
 
     rows = []
     for qtype, src_split, pool in pools:
@@ -392,8 +394,8 @@ def process_dataset(
     return rows
 
 
-# In-domain (train and test from the same domain) and LODO (train on three
-# domains, test on the held-out one) scenario -> filename maps.
+# In-domain scenario -> filename map. We do not process the LODO datasets: their
+# test split is the same as the in-domain one (see process_dataset).
 INDOMAIN_DATASETS = {
     "A-A": "a-a.csv",
     "B-B": "b-b.csv",
@@ -401,60 +403,96 @@ INDOMAIN_DATASETS = {
     "D-D": "d-d.csv",
 }
 
-LODO_DATASETS = {
-    "BCD-A": "bcd-a.csv",
-    "ACD-B": "acd-b.csv",
-    "ABD-C": "abd-c.csv",
-    "ABC-D": "abc-d.csv",
-}
+# External datasets. Change to actual location of datasets.
+KAGGLE_PATH = Path.home() / "datasets" / "kaggle" / "Modified_SQL_Dataset.csv"
+WAFAMOLE_DIR = Path.home() / "repos" / "wafamole_dataset"
+
+METRICS = ["lex", "synt", "sem"]
 
 
-def process_datasets(datasets: dict, results_filename: str):
-    """Compute lexical, syntactic and semantic diversity for each dataset and
-    write one aggregated CSV (`results_filename`, under ../output) with all
-    metrics, one row per (dataset, label type).
-
-    For every CSV, process_dataset draws normal queries from the train split and
-    attacks from the test split, computes lexical/syntactic metrics on the full
-    pools and semantic diversity on a 20k sub-pool per label. In-domain and LODO
-    differ only in which files are processed (see process_dataset for the why).
-    """
-    rows = []
-    for name, filename in datasets.items():
-        df = pd.read_csv(DATASETS_DIR / filename, dtype=DTYPES)
-        rows.extend(process_dataset(df=df, name=name))
-
+def write_results(rows: list, results_filename: str):
     results = pd.DataFrame(rows)
     out_path = Path("../output") / results_filename
     results.to_csv(out_path, index=False)
     print(f"Wrote aggregated metrics ({len(results)} rows) to {out_path}")
 
 
+def process_datasets(datasets: dict, results_filename: str, metrics: list):
+    """Compute the selected diversity metrics for each dataset and write one
+    aggregated CSV (`results_filename`, under ../output), one row per
+    (dataset, label type).
+
+    For every CSV, process_dataset draws normal queries and attacks from the test
+    split, computes lexical/syntactic metrics on the full pools and semantic
+    diversity on a 20k sub-pool per label (see process_dataset for the why).
+    """
+    rows = []
+    for name, filename in datasets.items():
+        df = pd.read_csv(DATASETS_DIR / filename, dtype=DTYPES)
+        rows.extend(process_dataset(df=df, name=name, **metric_flags(metrics)))
+
+    write_results(rows, results_filename)
+
+
+def metric_flags(metrics: list) -> dict:
+    return {
+        "vocab": "lex" in metrics,
+        "parse_trees": "synt" in metrics,
+        "div_sem": "sem" in metrics,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description=(
             "Compute lexical (vocab), syntactic (parse trees) and semantic "
-            "(div_sem) diversity of the SQLIA datasets. Normal queries come from "
-            "the train split, attacks from the test split; lexical/syntactic run "
-            "on the full pools, semantic on a 20k sub-pool per label. Choose "
-            "'indomain' for A->A, B->B, ... or 'lodo' for the cross-domain "
-            "leave-one-domain-out sets BCD->A, ACD->B, ..."
+            "(div_sem) diversity of the SQLIA datasets. Normal queries and "
+            "attacks come from the test split (target domain); lexical/syntactic "
+            "run on the full pools, semantic on a 20k sub-pool per label. Choose "
+            "'indomain' for A->A, B->B, ... 'kaggle' and 'wafamole' process the "
+            "external datasets, which have no split."
         )
     )
     parser.add_argument(
         "--mode",
-        choices=["indomain", "lodo"],
+        choices=["indomain", "kaggle", "wafamole"],
+        nargs="+",
         required=True,
-        help="Which datasets to process.",
+        help="Which datasets to process (one or more).",
+    )
+    parser.add_argument(
+        "--metrics",
+        choices=METRICS,
+        nargs="+",
+        default=METRICS,
+        help="Which metrics to compute (default: all).",
     )
     args = parser.parse_args()
 
     Path("../output").mkdir(exist_ok=True, parents=True)
 
-    if args.mode == "indomain":
-        process_datasets(INDOMAIN_DATASETS, "results_indomain.csv")
-    elif args.mode == "lodo":
-        process_datasets(LODO_DATASETS, "results_lodo.csv")
+    # A partial run must not overwrite the results of a full run.
+    suffix = "" if set(args.metrics) == set(METRICS) else "_" + "-".join(args.metrics)
+
+    for mode in args.mode:
+        results_filename = f"results_{mode}{suffix}.csv"
+        if mode == "indomain":
+            process_datasets(INDOMAIN_DATASETS, results_filename, args.metrics)
+        elif mode == "kaggle":
+            df = load_kaggle_samples(KAGGLE_PATH)
+            rows = process_dataset(
+                df=df, name="Kaggle", split_column=None, **metric_flags(args.metrics)
+            )
+            write_results(rows, results_filename)
+        elif mode == "wafamole":
+            df = load_wafamole_samples(
+                fp_sane=WAFAMOLE_DIR / "sane.sql",
+                fp_attacks=WAFAMOLE_DIR / "attacks.sql",
+            )
+            rows = process_dataset(
+                df=df, name="WAF-A-MoLE", split_column=None, **metric_flags(args.metrics)
+            )
+            write_results(rows, results_filename)
 
 
 if __name__ == "__main__":
